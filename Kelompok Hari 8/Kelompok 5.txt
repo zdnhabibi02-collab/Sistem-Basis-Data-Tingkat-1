@@ -1,0 +1,308 @@
+# Pipeline Dummy
+from pymongo import MongoClient
+from datetime import datetime, timedelta
+import random
+
+client = MongoClient('mongodb://localhost:27017')
+db = client['studi_kasus_oee']
+collection = db['produksi_harian']
+collection.drop()  # Mulai bersih
+
+mesin_list = [f"M{i:02d}" for i in range(1, 11)]
+start_date = datetime(2026, 4, 1)
+docs = []
+
+for i in range(1000):
+    # Acak hari dalam 90 hari
+    day_offset = random.randint(0, 90)
+    tanggal = start_date + timedelta(days=day_offset)
+    shift = random.randint(1, 3)
+    mesin = random.choice(mesin_list)
+    target = random.randint(200, 500)
+    actual_ok = int(target * random.uniform(0.6, 1.0))  # Kadang di bawah target
+    actual_reject = int(actual_ok * random.uniform(0, 0.15))  # reject sampai 15%
+    durasi_tersedia = 480  # 8 jam
+    durasi_operasi = int(durasi_tersedia * random.uniform(0.7, 1.0))
+
+    doc = {
+        "mesin": mesin,
+        "tanggal": tanggal,
+        "shift": shift,
+        "target": target,
+        "actual_ok": actual_ok,
+        "actual_reject": actual_reject,
+        "durasi_operasi_menit": durasi_operasi,
+        "durasi_tersedia_menit": durasi_tersedia
+    }
+    docs.append(doc)
+
+    if len(docs) >= 500:
+        collection.insert_many(docs)
+        docs.clear()
+
+if docs:
+    collection.insert_many(docs)
+
+print("Data berhasil dibuat. Total:", collection.count_documents({}))
+
+# Menghitung OEE Secara Kasar
+
+db.produksi_harian.aggregate([
+  {
+    $project: {
+      oee: {
+        $multiply: [
+          { $divide: ["$actual_ok", "$target"] },
+          { $divide: ["$durasi_operasi_menit", "$durasi_tersedia_menit"] },
+          { $divide: ["$actual_ok", { $add: ["$actual_ok", "$actual_reject"] }] }
+        ]
+      }
+    }
+  }
+])
+
+# db.produksi_harian.aggregate([
+  {
+    $group: {
+      _id: {
+        mesin: "$mesin",
+        bulan: { $month: "$tanggal" },
+        tahun: { $year: "$tanggal" }
+      },
+      total_target: { $sum: "$target" },
+      total_ok: { $sum: "$actual_ok" },
+      total_reject: { $sum: "$actual_reject" },
+      total_operasi: { $sum: "$durasi_operasi_menit" },
+      total_tersedia: { $sum: "$durasi_tersedia_menit" }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      mesin: "$_id.mesin",
+      bulan: "$_id.bulan",
+      tahun: "$_id.tahun",
+
+      availability: {
+        $divide: ["$total_operasi", "$total_tersedia"]
+      },
+      performance: {
+        $divide: ["$total_ok", "$total_target"]
+      },
+      quality: {
+        $divide: [
+          "$total_ok",
+          { $add: ["$total_ok", "$total_reject"] }
+        ]
+      },
+      OEE: {
+        $multiply: [
+          { $divide: ["$total_ok", "$total_target"] },
+          { $divide: ["$total_operasi", "$total_tersedia"] },
+          {
+            $divide: [
+              "$total_ok",
+              { $add: ["$total_ok", "$total_reject"] }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  {
+    $sort: { OEE: 1 }
+  }
+])
+
+# Menemukan OEE <= 80%
+
+db.produksi_harian.aggregate([
+  {
+    $match: {
+      tanggal: {
+        $gte: ISODate("2026-06-01"),
+        $lt: ISODate("2026-07-01")
+      }
+    }
+  },
+  {
+    $group: {
+      _id: "$mesin",
+      total_target: { $sum: "$target" },
+      total_ok: { $sum: "$actual_ok" },
+      total_reject: { $sum: "$actual_reject" },
+      total_operasi: { $sum: "$durasi_operasi_menit" },
+      total_tersedia: { $sum: "$durasi_tersedia_menit" }
+    }
+  },
+  {
+    $project: {
+      _id: 0,
+      mesin: "$_id",
+      OEE: {
+        $multiply: [
+          { $divide: ["$total_ok", "$total_target"] },
+          { $divide: ["$total_operasi", "$total_tersedia"] },
+          {
+            $divide: [
+              "$total_ok",
+              { $add: ["$total_ok", "$total_reject"] }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  {
+    $match: {
+      OEE: { $lt: 0.8 }
+    }
+  },
+  {
+    $sort: { OEE: 1 }
+  }
+])
+
+# Distribusi Jumlah per Shift
+
+db.produksi_harian.aggregate([
+  {
+    $bucket: {
+      groupBy: "$actual_ok",
+      boundaries: [0, 200, 300, 400, 600],
+      default: "di atas 600",
+      output: {
+        jumlah_data: { $sum: 1 },
+        rata_reject: { $avg: "$actual_reject" }
+      }
+    }
+  }
+])
+
+# Tugas Terstruktur
+
+# Pipe Line 1
+db.inspeksi.aggregate([
+        	db.inspeksi.aggregate([
+        	{ $addFields: {
+        	persen_cacat: {
+    		$multiply: [
+      	  { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] },
+      	  100
+    		]
+        	}
+        	}},
+        	{ $sort: { persen_cacat: -1 } },
+        	{ $limit: 10 }
+])
+# Pipe Line 2
+db.inspeksi.aggregate([
+        	{ $lookup: {
+        	from: "target_kualitas",
+        	localField: "batch_id",
+        	foreignField: "batch_id",
+        	as: "target_info"
+        	}},
+        	{ $unwind: "$target_info" },
+        	{ $addFields: {
+  	  	persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] },
+        	target_maks: "$target_info.target_maks_cacat"
+        	}},
+        	{ $addFields: {
+  	  	status: { $cond: { if: { $gt: ["$persen_cacat", "$target_maks"] }, then: "NOT OK", else: "OK" } }
+        	}},
+        	{ $project: {
+        	_id: 0,
+        	batch_id: 1,
+        	mesin: 1,
+        	 persen_cacat: 1,
+        	target_maks: 1,
+        	status: 1,
+        	selisih: { $subtract: ["$persen_cacat", "$target_maks"] }
+        	}},
+        	{ $sort: { selisih: -1 } },
+        	{ $limit: (10)}
+]) 
+# Pipe Line 3
+db.inspeksi.aggregate([
+  { $lookup: {
+  	from: "target_kualitas",
+  	localField: "batch_id",
+  	foreignField: "batch_id",
+  	as: "target_info"
+  }},
+  { $unwind: "$target_info" },
+  { $addFields: {
+  	persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] }
+  }},
+  { $addFields: {
+  	status: { $cond: { if: { $gt: ["$persen_cacat", "$target_info.target_maks_cacat"] }, then: "NOT OK", else: "OK" } }
+  }},
+  { $match: { status: "NOT OK" } },
+  { $group: {
+  	_id: {
+    	mesin: "$mesin",
+    	minggu: { $week: "$tanggal" },
+    	tahun: { $year: "$tanggal" }
+  	},
+  	jumlah_NOT_OK: { $sum: 1 }
+  }},
+  { $sort: { "_id.tahun": 1, "_id.minggu": 1, "_id.mesin": 1 } }
+]) 
+
+# Pipe Line 4
+db.inspeksi.aggregate([
+  { $match: {
+  	tanggal: { $gte: ISODate("2026-05-01"), $lt: ISODate("2026-06-01") }
+  }},
+  { $lookup: {
+  	from: "target_kualitas",
+  	localField: "batch_id",
+  	foreignField: "batch_id",
+  	as: "target_info"
+  }},
+  { $unwind: "$target_info" },
+  { $addFields: {
+  	persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] }
+  }},
+  { $addFields: {
+  	status: { $cond: { if: { $gt: ["$persen_cacat", "$target_info.target_maks_cacat"] }, then: "NOT OK", else: "OK" } }
+  }},
+  { $match: { status: "NOT OK" } },
+  { $group: {
+  	_id: "$mesin",
+  	total_NOT_OK: { $sum: 1 }
+  }},
+  { $sort: { total_NOT_OK: -1 } },
+  { $limit: 3 }
+])
+
+# Pipe Line 5
+db.inspeksi.aggregate([
+{ $match: { tanggal: { $gte: ISODate("2026-06-01"), $lt: ISODate("2026-07-01") } } },
+  { $lookup: {
+  	from: "target_kualitas",
+  	localField: "batch_id",
+  	foreignField: "batch_id",
+  	as: "target_info"
+  }},
+  { $unwind: "$target_info" },
+  { $addFields: {
+  	persen_cacat: { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] },
+status: { $cond: { if: { $gt: [ { $multiply: [ { $divide: ["$cacat_ditemukan", "$jumlah_diperiksa"] }, 100 ] }, "$target_info.target_maks_cacat" ] }, then: "NOT OK", else: "OK" } }
+  }},
+  { $facet: {
+  	"total_batch": [
+    	{ $count: "count" }
+  	],
+  	"rata_cacat": [
+    	{ $group: { _id: null, avg_cacat: { $avg: "$persen_cacat" } } }
+  	],
+  	"mesin_terburuk": [
+    	{ $match: { status: "NOT OK" } },
+    	{ $group: { _id: "$mesin", jumlah: { $sum: 1 } } },
+    	{ $sort: { jumlah: -1 } },
+    	{ $limit: 3 }
+  	]
+  }}
+])
